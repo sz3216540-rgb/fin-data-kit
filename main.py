@@ -136,11 +136,16 @@ def safe_int(value, default=0):
         return default
 
 
+# ========== 工具函数：严谨处理 6 位代码 ==========
 def clean_symbol(symbol: str):
-    match = re.search(r'\d{6}', symbol)
+    match = re.search(r'\d{6}', str(symbol))
     if not match:
-        return symbol, symbol
-    code = match.group(0)
+        # 如果提取不到 6 位数字，试着左侧补零
+        digits = re.sub(r'\D', '', str(symbol))
+        code = digits.zfill(6)
+    else:
+        code = match.group(0)
+    
     prefix = "sh" if code.startswith("6") or code.startswith("9") else "sz"
     return code, f"{prefix}{code}"
 
@@ -187,44 +192,47 @@ async def fetch_multiple_urls(urls: List[str]) -> List[Optional[Dict]]:
         return await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ========== 财务核心（纯异步机制）==========
+# ========== 财务核心（增强兼容性）==========
 async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
     cache_key = get_cache_key("financial", code)
     cached = get_from_cache(cache_key)
     if cached:
         return cached
-
+    
     try:
-        base_params = f"reportName=RPT_LICO_FN_CPD&filter=(SECURITY_CODE%3D%22{code}%22)&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE"
-
+        # 确保 code 必定是 6 位字符串
+        code = str(code).zfill(6)
+        
+        base_params = f"reportName=RPT_LICO_FN_CPD&filter=(SECURITY_CODE%3D%22{code}%22)&pageNumber=1&pageSize=8&sortTypes=-1&sortColumns=REPORT_DATE"
+        
         income_fields = "SECURITY_CODE,REPORT_DATE,TOTAL_OPERATE_INCOME,OPERATE_COST,SALES_EXPENSE,MANAGE_EXPENSE,FINANCE_EXPENSE,OPERATE_PROFIT,TOTAL_PROFIT,PARENT_NETPROFIT,KCFJCXSYJLR,DEDUCT_BASIC_EPS,DILUTE_EPS"
         balance_fields = "SECURITY_CODE,REPORT_DATE,TOTAL_ASSET,TOTAL_LIAB,SHAREHOLDER_EQUITY,CASH_BALANCE,ACCOUNTS_RECEIVABLE,INVENTORIES,FIXED_ASSET,INTANGIBLE_ASSET,GOODWILL,TOTAL_CAPITAL_STOCK"
         cashflow_fields = "SECURITY_CODE,REPORT_DATE,OPERATE_CASH_FLOW,INVEST_CASH_FLOW,FINANCE_CASH_FLOW,FREE_CASH_FLOW"
         indicator_fields = "SECURITY_CODE,REPORT_DATE,WEIGHTAVG_ROE,ROA,GROSS_PROFIT_RATIO,SALES_NETP_RATIO,DEBT_ASSET_RATIO,OPERATE_CASHFLOW_PER_SHARE,CURRENT_RATIO,QUICK_RATIO"
-
+        
         urls = [
             f"https://datacenter-web.eastmoney.com/api/data/v1/get?{base_params}&columns={income_fields}",
             f"https://datacenter-web.eastmoney.com/api/data/v1/get?{base_params}&columns={balance_fields}",
             f"https://datacenter-web.eastmoney.com/api/data/v1/get?{base_params}&columns={cashflow_fields}",
             f"https://datacenter-web.eastmoney.com/api/data/v1/get?{base_params}&columns={indicator_fields}"
         ]
-
+        
         responses = await fetch_multiple_urls(urls)
-
+        
         reports_dict = {}
         for resp in responses:
             if not resp or isinstance(resp, Exception):
                 continue
             try:
-                if "result" in resp and "data" in resp.get("result", {}):
+                if "result" in resp and resp["result"] and "data" in resp["result"]:
                     for item in resp["result"]["data"]:
                         report_date = item.get("REPORT_DATE", "")
                         if not report_date:
                             continue
-                        date_key = report_date[:10]
+                        date_key = str(report_date)[:10]
                         if date_key not in reports_dict:
                             reports_dict[date_key] = {}
-
+                        
                         standard_data = FieldMapper.to_standard(item)
                         for field_key, field_value in standard_data.items():
                             if field_value != 0.0:
@@ -232,10 +240,10 @@ async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
             except Exception as e:
                 print(f"解析数据失败: {str(e)}")
                 continue
-
+        
         if not reports_dict:
             return None
-
+        
         sorted_dates = sorted(reports_dict.keys(), reverse=True)
         reports = []
         for date in sorted_dates[:5]:
@@ -244,17 +252,16 @@ async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
                     "report_date": date,
                     "data": reports_dict[date]
                 })
-
+        
         if reports:
             set_to_cache(cache_key, reports)
-
+        
         return reports
-
+        
     except Exception as e:
         print(f"东方财富数据获取失败: {str(e)}")
         return None
-
-
+        
 def fetch_tencent_spot(symbol: str) -> Optional[Dict]:
     try:
         _, full_symbol = clean_symbol(symbol)
