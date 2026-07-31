@@ -7,6 +7,7 @@ import aiohttp
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 import redis
+import httpx
 
 app = FastAPI(title="A股基本面数据服务")
 
@@ -192,7 +193,13 @@ async def fetch_multiple_urls(urls: List[str]) -> List[Optional[Dict]]:
         return await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ========== 财务核心（增强兼容性）==========
+# 防封禁的 Headers 伪装
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://data.eastmoney.com/",
+    "Accept": "*/*"
+}
+
 async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
     cache_key = get_cache_key("financial", code)
     cached = get_from_cache(cache_key)
@@ -200,9 +207,9 @@ async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
         return cached
     
     try:
-        # 确保 code 必定是 6 位字符串
         code = str(code).zfill(6)
         
+        # 使用通用业绩报表接口 RPT_LICO_FN_CPD
         base_params = f"reportName=RPT_LICO_FN_CPD&filter=(SECURITY_CODE%3D%22{code}%22)&pageNumber=1&pageSize=8&sortTypes=-1&sortColumns=REPORT_DATE"
         
         income_fields = "SECURITY_CODE,REPORT_DATE,TOTAL_OPERATE_INCOME,OPERATE_COST,SALES_EXPENSE,MANAGE_EXPENSE,FINANCE_EXPENSE,OPERATE_PROFIT,TOTAL_PROFIT,PARENT_NETPROFIT,KCFJCXSYJLR,DEDUCT_BASIC_EPS,DILUTE_EPS"
@@ -224,7 +231,7 @@ async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
             if not resp or isinstance(resp, Exception):
                 continue
             try:
-                if "result" in resp and resp["result"] and "data" in resp["result"]:
+                if "result" in resp and resp.get("result") and "data" in resp["result"]:
                     for item in resp["result"]["data"]:
                         report_date = item.get("REPORT_DATE", "")
                         if not report_date:
@@ -235,7 +242,7 @@ async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
                         
                         standard_data = FieldMapper.to_standard(item)
                         for field_key, field_value in standard_data.items():
-                            if field_value != 0.0:
+                            if field_value is not None:
                                 reports_dict[date_key][field_key] = field_value
             except Exception as e:
                 print(f"解析数据失败: {str(e)}")
@@ -243,6 +250,24 @@ async def fetch_eastmoney_financial(code: str) -> Optional[List[Dict]]:
         
         if not reports_dict:
             return None
+        
+        sorted_dates = sorted(reports_dict.keys(), reverse=True)
+        reports = []
+        for date in sorted_dates[:5]:
+            if reports_dict[date]:
+                reports.append({
+                    "report_date": date,
+                    "data": reports_dict[date]
+                })
+        
+        if reports:
+            set_to_cache(cache_key, reports)
+        
+        return reports
+        
+    except Exception as e:
+        print(f"东方财富数据获取失败: {str(e)}")
+        return None
         
         sorted_dates = sorted(reports_dict.keys(), reverse=True)
         reports = []
